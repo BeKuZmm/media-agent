@@ -1,9 +1,0 @@
-anthropic
-python-telegram-bot==20.7
-aiohttp
-duckduckgo-search
-instagrapi
-Pillow
-requests
-apscheduler
-google-generativeai
