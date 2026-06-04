@@ -1,8 +1,9 @@
-import anthropic
 import os
 import json
+from google import genai
+from google.genai import types
 from agents.writer import write_content
-from agents.analyst import analyze_image_from_url, analyze_image_from_bytes, suggest_image_for_topic
+from agents.analyst import analyze_image_from_url, analyze_image_from_bytes, suggest_image_for_topic, create_post_from_image_analysis
 from agents.news import get_news_summary, get_trending_topics
 from agents.translator import translate, translate_post, detect_language
 from agents.scheduler import schedule_post, get_scheduled_posts, cancel_post, parse_time_from_text, start_scheduler
@@ -10,33 +11,32 @@ from publisher.telegram_pub import post_to_channel
 from publisher.instagram import post_to_instagram
 from publisher.image_fetcher import find_image, get_image_bytes
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-# Foydalanuvchi suhbat tarixlari
 conversation_history = {}
 
-TOOLS = [
+TOOLS_SCHEMA = [
     {
         "name": "write_content",
         "description": "Berilgan mavzu bo'yicha Instagram va Telegram uchun kontent yozadi",
         "input_schema": {
             "type": "object",
             "properties": {
-                "topic": {"type": "string", "description": "Kontent mavzusi"},
-                "style": {"type": "string", "enum": ["informative", "entertaining", "news", "promotional"], "default": "informative"},
-                "language": {"type": "string", "enum": ["uz", "ru", "en"], "default": "uz"}
+                "topic": {"type": "string"},
+                "style": {"type": "string", "enum": ["informative", "entertaining", "news", "promotional"]},
+                "language": {"type": "string", "enum": ["uz", "ru", "en"]}
             },
             "required": ["topic"]
         }
     },
     {
         "name": "get_news",
-        "description": "Mavzu bo'yicha yangiliklar qidirib, post tayyorlaydi",
+        "description": "Mavzu bo'yicha yangiliklar qidirib post tayyorlaydi",
         "input_schema": {
             "type": "object",
             "properties": {
-                "topic": {"type": "string", "description": "Yangilik mavzusi"},
-                "language": {"type": "string", "enum": ["uz", "ru", "en"], "default": "uz"}
+                "topic": {"type": "string"},
+                "language": {"type": "string", "enum": ["uz", "ru", "en"]}
             },
             "required": ["topic"]
         }
@@ -48,20 +48,20 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "text": {"type": "string"},
-                "target_lang": {"type": "string", "enum": ["uz", "ru", "en", "tr", "ar"], "description": "Maqsad til"}
+                "target_lang": {"type": "string", "enum": ["uz", "ru", "en", "tr", "ar"]}
             },
             "required": ["text", "target_lang"]
         }
     },
     {
         "name": "post_now",
-        "description": "Tayyorlangan kontentni hozir Telegram kanal va/yoki Instagram ga post qiladi",
+        "description": "Kontentni hozir Telegram kanal va Instagram ga post qiladi",
         "input_schema": {
             "type": "object",
             "properties": {
-                "post_data": {"type": "object", "description": "Post ma'lumotlari (instagram_text, telegram_text, hashtags, title)"},
-                "platforms": {"type": "array", "items": {"type": "string", "enum": ["telegram", "instagram"]}, "default": ["telegram", "instagram"]},
-                "image_query": {"type": "string", "description": "Rasm qidirish so'zi (inglizcha)"}
+                "post_data": {"type": "object"},
+                "platforms": {"type": "array", "items": {"type": "string"}},
+                "image_query": {"type": "string"}
             },
             "required": ["post_data"]
         }
@@ -73,8 +73,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "post_data": {"type": "object"},
-                "time_text": {"type": "string", "description": "Vaqt matni, masalan: 'ertaga soat 10:00', '2 soatdan keyin'"},
-                "platforms": {"type": "array", "items": {"type": "string"}, "default": ["telegram", "instagram"]}
+                "time_text": {"type": "string"},
+                "platforms": {"type": "array", "items": {"type": "string"}}
             },
             "required": ["post_data", "time_text"]
         }
@@ -99,22 +99,28 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "category": {"type": "string", "enum": ["general", "tech", "business", "sports", "entertainment"], "default": "general"}
+                "category": {"type": "string", "enum": ["general", "tech", "business", "sports", "entertainment"]}
             }
         }
     }
 ]
 
+# Gemini uchun tool formatiga o'tkazish
+def build_gemini_tools():
+    from google.genai.types import Tool, FunctionDeclaration
+    declarations = []
+    for t in TOOLS_SCHEMA:
+        declarations.append(FunctionDeclaration(
+            name=t["name"],
+            description=t["description"],
+            parameters=t["input_schema"]
+        ))
+    return [Tool(function_declarations=declarations)]
+
 
 async def run_tool(name: str, inputs: dict, image_bytes: bytes = None) -> str:
-    """Tool ni bajaradi"""
-
     if name == "write_content":
-        result = await write_content(
-            inputs["topic"],
-            inputs.get("style", "informative"),
-            inputs.get("language", "uz")
-        )
+        result = await write_content(inputs["topic"], inputs.get("style", "informative"), inputs.get("language", "uz"))
         return json.dumps(result, ensure_ascii=False)
 
     elif name == "get_news":
@@ -122,8 +128,7 @@ async def run_tool(name: str, inputs: dict, image_bytes: bytes = None) -> str:
         return json.dumps(result, ensure_ascii=False)
 
     elif name == "translate_content":
-        result = await translate(inputs["text"], inputs["target_lang"])
-        return result
+        return await translate(inputs["text"], inputs["target_lang"])
 
     elif name == "post_now":
         post_data = inputs["post_data"]
@@ -131,27 +136,20 @@ async def run_tool(name: str, inputs: dict, image_bytes: bytes = None) -> str:
         image_query = inputs.get("image_query", post_data.get("title", ""))
         results = {}
 
-        # Rasm qidirish
         image_url = None
         if image_query:
             image_info = await find_image(image_query)
             if image_info:
                 image_url = image_info["url"]
 
-        # Telegram ga post
         if "telegram" in platforms:
-            tg_result = await post_to_channel(post_data, image_url)
-            results["telegram"] = tg_result
-
-        # Instagram ga post
+            results["telegram"] = await post_to_channel(post_data, image_url)
         if "instagram" in platforms:
-            ig_result = await post_to_instagram(post_data, image_url)
-            results["instagram"] = ig_result
+            results["instagram"] = await post_to_instagram(post_data, image_url)
 
         return json.dumps(results, ensure_ascii=False)
 
     elif name == "schedule_post":
-        from datetime import datetime
         post_data = inputs["post_data"]
         platforms = inputs.get("platforms", ["telegram", "instagram"])
         publish_time = parse_time_from_text(inputs["time_text"])
@@ -171,12 +169,12 @@ async def run_tool(name: str, inputs: dict, image_bytes: bytes = None) -> str:
             return "Rejalashtirilgan postlar yo'q"
         result = "📅 Rejalashtirilgan postlar:\n\n"
         for p in posts:
-            result += f"🔹 {p['title']}\n   Vaqt: {p['time']}\n   ID: {p['id']}\n   Status: {p['status']}\n\n"
+            result += f"🔹 {p['title']}\n   Vaqt: {p['time']}\n   ID: {p['id']}\n\n"
         return result
 
     elif name == "cancel_scheduled":
         success = cancel_post(inputs["job_id"])
-        return "✅ Post bekor qilindi" if success else "❌ Post topilmadi"
+        return "✅ Bekor qilindi" if success else "❌ Topilmadi"
 
     elif name == "get_trending":
         topics = await get_trending_topics(inputs.get("category", "general"))
@@ -191,66 +189,70 @@ async def run_tool(name: str, inputs: dict, image_bytes: bytes = None) -> str:
 
 
 async def process_message(user_id: int, message: str, image_bytes: bytes = None) -> str:
-    """Foydalanuvchi xabarini qayta ishlaydi"""
-
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
     history = conversation_history[user_id]
 
-    # Rasm bo'lsa Gemini bilan tahlil qilamiz
+    # Rasm bo'lsa Gemini bilan tahlil
     extra_context = ""
     if image_bytes:
-        from agents.analyst import create_post_from_image_analysis
         analysis = await create_post_from_image_analysis(image_bytes)
-        import json
-        extra_context = f"\n\n[Foydalanuvchi rasm yubordi. Gemini tahlili: {json.dumps(analysis, ensure_ascii=False)}]"
-
-    history.append({"role": "user", "content": message + extra_context})
+        extra_context = f"\n\n[Foydalanuvchi rasm yubordi. Tahlil: {json.dumps(analysis, ensure_ascii=False)}]"
 
     system_prompt = """Sen media menejeri AI agentsan. O'zbek tilida javob berasan.
+Vazifalar: kontent yozish, yangiliklar qidirish, tarjima, post rejalashtirish, publish qilish.
+Har doim aniq va foydali bo'l."""
 
-Quyidagi vazifalarni bajarasan:
-- Kontent yozish (Instagram, Telegram uchun)
-- Yangiliklar qidirib post tayyorlash
-- Matnlarni tarjima qilish
-- Postlarni hozir yoki keyinroq publish qilish
-- Rejalashtirilgan postlarni boshqarish
-- Trend mavzularni ko'rsatish
+    # Tarix + yangi xabar
+    contents = []
+    for h in history:
+        contents.append({"role": h["role"], "parts": [{"text": h["content"]}]})
+    contents.append({"role": "user", "parts": [{"text": system_prompt + "\n\n" + message + extra_context}]})
 
-Har doim aniq va foydali bo'l. Post tayyorganda foydalanuvchiga ko'rsatib, tasdiqlashni so'ra."""
+    gemini_tools = build_gemini_tools()
 
+    # Agent sikli
     while True:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            system=system_prompt,
-            tools=TOOLS,
-            messages=history
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(tools=gemini_tools)
         )
 
-        history.append({"role": "assistant", "content": response.content})
+        candidate = response.candidates[0]
+        parts = candidate.content.parts
 
-        if response.stop_reason == "end_turn":
+        # Tool chaqirilganmi?
+        tool_calls = [p for p in parts if hasattr(p, "function_call") and p.function_call]
+
+        if not tool_calls:
+            # Javob tayyor
+            text = ""
+            for p in parts:
+                if hasattr(p, "text") and p.text:
+                    text += p.text
+            history.append({"role": "user", "content": message})
+            history.append({"role": "model", "content": text})
             if len(history) > 30:
                 conversation_history[user_id] = history[-30:]
-            for block in response.content:
-                if hasattr(block, "text"):
-                    return block.text
-            return "Javob yo'q"
+            return text or "Javob yo'q"
 
-        # Toollarni bajar
+        # Tool natijalarini bajarish
+        contents.append({"role": "model", "parts": [{"function_call": p.function_call} for p in tool_calls]})
+
         tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                result = await run_tool(block.name, block.input, image_bytes)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result
-                })
+        for p in tool_calls:
+            fc = p.function_call
+            result = await run_tool(fc.name, dict(fc.args))
+            tool_results.append({
+                "function_response": {
+                    "name": fc.name,
+                    "response": {"result": result}
+                }
+            })
 
-        history.append({"role": "user", "content": tool_results})
+        contents.append({"role": "user", "parts": tool_results})
 
 
 def clear_history(user_id: int):
