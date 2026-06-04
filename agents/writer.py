@@ -1,19 +1,11 @@
-import anthropic
 import os
+import json
+from google import genai
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 async def write_content(topic: str, style: str = "informative", language: str = "uz") -> dict:
-    """
-    Kontent yozuvchi agent
-    style: informative, entertaining, news, promotional
-    language: uz (o'zbek), ru (rus), en (ingliz)
-    """
-    lang_map = {
-        "uz": "O'zbek tilida",
-        "ru": "Rus tilida", 
-        "en": "Ingliz tilida"
-    }
+    lang_map = {"uz": "O'zbek tilida", "ru": "Rus tilida", "en": "Ingliz tilida"}
     style_map = {
         "informative": "ma'lumotli va tushunarli",
         "entertaining": "qiziqarli va kulgili",
@@ -22,7 +14,7 @@ async def write_content(topic: str, style: str = "informative", language: str = 
     }
 
     prompt = f"""Sen media kontent yozuvchisan.
-    
+
 Mavzu: {topic}
 Uslub: {style_map.get(style, 'informative')}
 Til: {lang_map.get(language, "O'zbek tilida")}
@@ -43,16 +35,12 @@ JSON formatda javob ber:
 
 Faqat JSON, boshqa hech narsa yozma."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}]
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt
     )
 
-    import json
-    text = response.content[0].text.strip()
-    text = text.replace("```json", "").replace("```", "").strip()
-    
+    text = response.text.strip().replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(text)
     except:
